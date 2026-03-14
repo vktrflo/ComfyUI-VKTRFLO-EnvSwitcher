@@ -5,18 +5,18 @@ const HOST_API_PORT = "38431";
 const STARTUP_STATE_PATH = "/api/v1/startup-state";
 const RUNTIME_STATUS_PATH = "/api/v1/runtime/status";
 const SWITCH_AND_START_PATH = "/api/v1/runtime/switch-and-start";
+const RUNTIME_START_PATH = "/api/v1/runtime/start";
+const RUNTIME_STOP_PATH = "/api/v1/runtime/stop";
 const SYSTEM_STATS_URL = "/system_stats";
 const PANEL_ID = "vktrflo-env-switcher-panel";
-const TOGGLE_ID = "vktrflo-env-switcher-toggle";
 const SWITCH_STATE_STORAGE_KEY = "vktrflo.env-switcher.switch-state";
-const SERVICE_BASE_URL_STORAGE_KEY = "vktrflo.env-switcher.service-base-url";
 const POST_SWITCH_RELOAD_STORAGE_KEY = "vktrflo.env-switcher.post-switch-reload";
+const PANEL_UI_STATE_STORAGE_KEY = "vktrflo.env-switcher.panel-ui";
 const RECONNECT_TIMEOUT_MS = 90000;
 const RECONNECT_INTERVAL_MS = 2000;
 
 const state = {
   mode: "bootstrapping",
-  visible: true,
   serviceBaseUrl: null,
   startupState: null,
   runtimeStatus: null,
@@ -25,14 +25,21 @@ const state = {
   lastUpdatedAt: null,
   selectedVersion: null,
   switchMessage: null,
+  switchOperation: null,
   switchTargetVersion: null,
   switchStartedAt: null,
   lastReconnectError: null,
+  panelUi: {
+    collapsed: false,
+    top: 84,
+    left: null,
+    selectedVersion: null,
+  },
 };
 
 let panelEl;
-let toggleEl;
 let progressRenderTimer = null;
+let dragState = null;
 
 function isSwitchInFlight(mode = state.mode) {
   return mode === "switch_pending" || mode === "reconnect_wait";
@@ -68,12 +75,7 @@ function defaultServiceBaseUrl() {
 }
 
 function resolveServiceBaseUrl() {
-  const configured = window.VKTRFLO_SERVICE_BASE_URL
-    ?? window.localStorage.getItem(SERVICE_BASE_URL_STORAGE_KEY)
-    ?? defaultServiceBaseUrl();
-  const normalized = normalizeBaseUrl(configured);
-  window.localStorage.setItem(SERVICE_BASE_URL_STORAGE_KEY, normalized);
-  return normalized;
+  return normalizeBaseUrl(window.VKTRFLO_SERVICE_BASE_URL ?? defaultServiceBaseUrl());
 }
 
 function serviceUrl(path) {
@@ -90,10 +92,7 @@ function setMode(nextMode) {
 }
 
 function switchModeForRestore(mode) {
-  if (mode === "switch_pending") {
-    return "reconnect_wait";
-  }
-  return mode ?? "reconnect_wait";
+  return mode === "switch_pending" ? "reconnect_wait" : (mode ?? "reconnect_wait");
 }
 
 function persistSwitchState() {
@@ -109,13 +108,14 @@ function persistSwitchState() {
         mode: state.mode,
         selectedVersion: state.selectedVersion,
         switchMessage: state.switchMessage,
+        switchOperation: state.switchOperation,
         switchTargetVersion: state.switchTargetVersion,
         switchStartedAt: state.switchStartedAt,
         lastReconnectError: state.lastReconnectError,
       }),
     );
   } catch (_error) {
-    // Storage failures should not break the panel.
+    // Ignore storage failures.
   }
 }
 
@@ -135,6 +135,7 @@ function restoreSwitchState() {
     state.mode = switchModeForRestore(persisted.mode);
     state.selectedVersion = persisted.selectedVersion ?? null;
     state.switchMessage = persisted.switchMessage ?? `Resuming engine switch to ${persisted.switchTargetVersion}.`;
+    state.switchOperation = persisted.switchOperation ?? "switch";
     state.switchTargetVersion = persisted.switchTargetVersion;
     state.switchStartedAt = persisted.switchStartedAt ?? new Date().toISOString();
     state.lastReconnectError = persisted.lastReconnectError ?? null;
@@ -146,11 +147,46 @@ function restoreSwitchState() {
 
 function resetSwitchState() {
   state.switchMessage = null;
+  state.switchOperation = null;
   state.switchTargetVersion = null;
   state.switchStartedAt = null;
   state.lastReconnectError = null;
   persistSwitchState();
   syncProgressRenderTimer();
+}
+
+function persistPanelUiState() {
+  try {
+    state.panelUi.selectedVersion = state.selectedVersion;
+    window.localStorage.setItem(PANEL_UI_STATE_STORAGE_KEY, JSON.stringify(state.panelUi));
+  } catch (_error) {
+    // Ignore storage failures.
+  }
+}
+
+function restorePanelUiState() {
+  try {
+    const raw = window.localStorage.getItem(PANEL_UI_STATE_STORAGE_KEY);
+    if (!raw) {
+      return;
+    }
+    const persisted = JSON.parse(raw);
+    if (typeof persisted?.collapsed === "boolean") {
+      state.panelUi.collapsed = persisted.collapsed;
+    }
+    if (Number.isFinite(persisted?.top)) {
+      state.panelUi.top = persisted.top;
+    }
+    if (persisted?.left == null || Number.isFinite(persisted.left)) {
+      state.panelUi.left = persisted.left ?? null;
+    }
+    if (typeof persisted?.selectedVersion === "string" || persisted?.selectedVersion == null) {
+      state.panelUi.selectedVersion = persisted.selectedVersion ?? null;
+      state.selectedVersion = persisted.selectedVersion ?? null;
+    }
+  } catch (_error) {
+    window.localStorage.removeItem(PANEL_UI_STATE_STORAGE_KEY);
+  }
 }
 
 function markPostSwitchReload(targetVersion) {
@@ -160,7 +196,7 @@ function markPostSwitchReload(targetVersion) {
       at: new Date().toISOString(),
     }));
   } catch (_error) {
-    // Session storage failures should not break the panel.
+    // Ignore storage failures.
   }
 }
 
@@ -170,7 +206,6 @@ function consumePostSwitchReloadMarker() {
     if (!raw) {
       return null;
     }
-
     window.sessionStorage.removeItem(POST_SWITCH_RELOAD_STORAGE_KEY);
     return JSON.parse(raw);
   } catch (_error) {
@@ -188,7 +223,6 @@ function stopProgressRenderTimer() {
   if (progressRenderTimer == null) {
     return;
   }
-
   window.clearInterval(progressRenderTimer);
   progressRenderTimer = null;
 }
@@ -197,13 +231,11 @@ function startProgressRenderTimer() {
   if (progressRenderTimer != null) {
     return;
   }
-
   progressRenderTimer = window.setInterval(() => {
     if (!isSwitchInFlight()) {
       stopProgressRenderTimer();
       return;
     }
-
     render();
   }, 1000);
 }
@@ -211,109 +243,77 @@ function startProgressRenderTimer() {
 function syncProgressRenderTimer() {
   if (isSwitchInFlight()) {
     startProgressRenderTimer();
-    return;
-  }
-
-  stopProgressRenderTimer();
-}
-
-function toneForRuntimeStatus(status) {
-  switch (status) {
-    case "ready":
-      return "ready";
-    case "loading":
-      return "loading";
-    case "error":
-      return "error";
-    case "missing":
-      return "missing";
-    default:
-      return "idle";
-  }
-}
-
-function labelForRuntimeStatus(status) {
-  switch (status) {
-    case "ready":
-      return "Engine Ready";
-    case "loading":
-      return "Engine Loading";
-    case "error":
-      return "Engine Error";
-    case "missing":
-      return "Engine Missing";
-    default:
-      return "Engine Idle";
+  } else {
+    stopProgressRenderTimer();
   }
 }
 
 function selectedProfileDetail() {
-  return state.runtimeStatus?.selected_install_profile ?? state.startupState?.runtime_process_install_profile ?? "unknown";
+  return state.runtimeStatus?.selected_install_profile ?? state.startupState?.runtime_process_install_profile ?? "gpu";
+}
+
+function selectedProfileRuntimeDetail() {
+  const selectedProfile = selectedProfileDetail();
+  return state.runtimeStatus?.profile_details?.find?.((detail) => detail.install_profile === selectedProfile) ?? null;
 }
 
 function activeRuntimeDetail() {
-  const selectedProfile = selectedProfileDetail();
-  const profileDetails = state.runtimeStatus?.profile_details?.find?.((detail) => detail.install_profile === selectedProfile) ?? null;
-  const activeRuntime = profileDetails?.active_runtime ?? null;
-
+  const profileDetail = selectedProfileRuntimeDetail();
+  const activeRuntime = profileDetail?.active_runtime ?? null;
   if (!activeRuntime?.version) {
     return null;
   }
 
-  const installedRuntime = Array.isArray(profileDetails?.installed_runtimes)
-    ? profileDetails.installed_runtimes.find((runtime) => runtime.version === activeRuntime.version) ?? null
+  const installedRuntime = Array.isArray(profileDetail?.installed_runtimes)
+    ? profileDetail.installed_runtimes.find((runtime) => runtime.version === activeRuntime.version) ?? null
     : null;
 
   return installedRuntime ? { ...installedRuntime, ...activeRuntime } : activeRuntime;
 }
 
-function parsePythonSemver(value) {
-  if (!value) return null;
-  const match = String(value).match(/\d+\.\d+\.\d+/);
-  return match ? match[0] : null;
-}
-
-function parsePythonMajorMinor(value) {
-  const semver = parsePythonSemver(value);
-  if (!semver) return null;
-  return semver.split(".").slice(0, 2).join(".");
-}
-
-function systemStatsPythonVersion() {
-  return parsePythonSemver(state.systemStats?.system?.python_version ?? null);
-}
-
 function installedRuntimes() {
-  const selectedProfile = selectedProfileDetail();
-  const profileDetails = state.runtimeStatus?.profile_details?.find?.((detail) => detail.install_profile === selectedProfile) ?? null;
-  return Array.isArray(profileDetails?.installed_runtimes) ? profileDetails.installed_runtimes : [];
+  const profileDetail = selectedProfileRuntimeDetail();
+  return Array.isArray(profileDetail?.installed_runtimes) ? profileDetail.installed_runtimes : [];
 }
 
 function sortedInstalledRuntimes() {
   return [...installedRuntimes()].sort((left, right) => String(right.version ?? "").localeCompare(String(left.version ?? "")));
 }
 
+function parsePythonSemver(value) {
+  if (!value) {
+    return null;
+  }
+  const match = String(value).match(/\d+\.\d+\.\d+/);
+  return match ? match[0] : null;
+}
+
+function parsePythonMajorMinor(value) {
+  const semver = parsePythonSemver(value);
+  return semver ? semver.split(".").slice(0, 2).join(".") : null;
+}
+
+function systemStatsPythonVersion() {
+  return parsePythonSemver(state.systemStats?.system?.python_version ?? null);
+}
+
+function systemStatsPythonMajorMinor() {
+  return parsePythonMajorMinor(state.systemStats?.system?.python_version ?? null);
+}
+
 function deriveLiveRuntimeVersion() {
-  const livePythonVersion = systemStatsPythonVersion();
-  const livePythonMajorMinor = parsePythonMajorMinor(livePythonVersion);
+  const livePythonMajorMinor = parsePythonMajorMinor(systemStatsPythonVersion());
   if (!livePythonMajorMinor) {
     return null;
   }
 
   const matches = sortedInstalledRuntimes().filter((runtime) => String(runtime.python_version ?? "").startsWith(livePythonMajorMinor));
-  if (matches.length === 1) {
-    return matches[0].version ?? null;
-  }
-
-  return null;
+  return matches.length === 1 ? matches[0].version ?? null : null;
 }
 
 function liveRuntimeDetail() {
   const liveVersion = deriveLiveRuntimeVersion();
-  if (!liveVersion) {
-    return null;
-  }
-  return installedRuntimes().find((runtime) => runtime.version === liveVersion) ?? null;
+  return liveVersion ? (installedRuntimes().find((runtime) => runtime.version === liveVersion) ?? null) : null;
 }
 
 function activeVersion() {
@@ -324,14 +324,12 @@ function parseTimestamp(value) {
   if (!value) {
     return null;
   }
-
   const parsed = new Date(value).getTime();
   return Number.isNaN(parsed) ? null : parsed;
 }
 
 function hostReportsTargetReady(targetVersion) {
-  const runtimeStatus = state.startupState?.runtime_process_status;
-  if (runtimeStatus !== "ready") {
+  if (state.startupState?.runtime_process_status !== "ready") {
     return false;
   }
 
@@ -342,11 +340,9 @@ function hostReportsTargetReady(targetVersion) {
 
   const switchStartedAt = parseTimestamp(state.switchStartedAt);
   const lastLaunchedAt = parseTimestamp(activeRuntime.last_launched_at);
-
   if (!switchStartedAt || !lastLaunchedAt) {
     return true;
   }
-
   return lastLaunchedAt >= switchStartedAt;
 }
 
@@ -354,100 +350,179 @@ function synchronizeSelectedVersion() {
   const runtimes = sortedInstalledRuntimes();
   const versions = new Set(runtimes.map((runtime) => runtime.version).filter(Boolean));
   if (state.selectedVersion && versions.has(state.selectedVersion)) {
+    persistPanelUiState();
     return;
   }
-
   state.selectedVersion = activeVersion() ?? runtimes[0]?.version ?? null;
+  persistPanelUiState();
 }
 
 function formatTimestamp(value) {
-  if (!value) return "Never";
+  if (!value) {
+    return "Never";
+  }
   const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) return String(value);
-  return parsed.toLocaleString();
+  if (Number.isNaN(parsed.getTime())) {
+    return String(value);
+  }
+  return parsed.toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
 }
 
 function formatElapsedSince(value) {
-  if (!value) return "0s";
+  if (!value) {
+    return "0s";
+  }
   const startedAt = new Date(value).getTime();
-  if (Number.isNaN(startedAt)) return "0s";
+  if (Number.isNaN(startedAt)) {
+    return "0s";
+  }
   const elapsedSeconds = Math.max(0, Math.round((Date.now() - startedAt) / 1000));
-  if (elapsedSeconds < 60) return `${elapsedSeconds}s`;
+  if (elapsedSeconds < 60) {
+    return `${elapsedSeconds}s`;
+  }
   const minutes = Math.floor(elapsedSeconds / 60);
   const seconds = elapsedSeconds % 60;
   return `${minutes}m ${seconds}s`;
 }
 
-function humanModeLabel(mode) {
-  switch (mode) {
-    case "bootstrapping":
-      return "Bootstrapping";
+function toneForStatus(status) {
+  switch (status) {
+    case "ready":
+      return "ready";
     case "loading":
-      return "Loading";
-    case "switch_pending":
-      return "Switch Pending";
-    case "reconnect_wait":
-      return "Reconnect Wait";
+      return "loading";
+    case "error":
+      return "error";
+    default:
+      return "idle";
+  }
+}
+
+function displayStatusLabel() {
+  if (state.mode === "switch_pending") {
+    return "Switching";
+  }
+  if (state.mode === "reconnect_wait") {
+    return "Restarting";
+  }
+  if (state.mode === "error") {
+    return "Error";
+  }
+
+  switch (state.startupState?.runtime_process_status) {
+    case "ready":
+      return "Ready";
+    case "loading":
+      return "Restarting";
     case "error":
       return "Error";
     default:
-      return "Ready";
+      return "Idle";
   }
 }
 
-function refreshButtonLabel() {
-  if (state.mode === "loading" || state.mode === "bootstrapping") {
-    return "Refreshing...";
+function currentStatusTone() {
+  if (state.mode === "switch_pending" || state.mode === "reconnect_wait") {
+    return "loading";
   }
-  if (state.mode === "reconnect_wait") {
-    return "Polling...";
+  if (state.mode === "error") {
+    return "error";
   }
-  return "Refresh";
+  return toneForStatus(state.startupState?.runtime_process_status ?? "idle");
+}
+
+function friendlyAcceleration(runtime) {
+  const cuda = String(runtime?.cuda_version ?? "").trim();
+  if (!cuda) {
+    return "GPU";
+  }
+  const match = cuda.match(/^cu(\d{2})(\d)$/i);
+  if (!match) {
+    return cuda.toUpperCase();
+  }
+  return `CUDA ${Number(match[1])}.${match[2]}`;
+}
+
+function gpuShortLabel() {
+  const primaryDeviceName = String(state.systemStats?.devices?.[0]?.name ?? "").trim();
+  const match = primaryDeviceName.match(/RTX\s+(\d{3,4})/i) ?? primaryDeviceName.match(/(\d{3,4})(?!.*\d)/);
+  if (match) {
+    return match[1];
+  }
+  return "GPU";
+}
+
+function currentComfyUiVersion() {
+  return (
+    state.systemStats?.system?.comfyui_version
+    ?? selectedProfileRuntimeDetail()?.comfyui_version
+    ?? state.runtimeStatus?.base_domain_comfyui_version
+    ?? "Unknown"
+  );
+}
+
+function currentPythonVersion(runtime) {
+  return String(runtime?.python_version ?? "").trim() || systemStatsPythonMajorMinor() || "Unknown";
+}
+
+function currentTorchVersion(runtime) {
+  return (
+    String(runtime?.torch_version ?? "").trim()
+    || String(state.systemStats?.system?.pytorch_version ?? "").trim()
+    || String(selectedProfileRuntimeDetail()?.torch_version ?? "").trim()
+    || "Unknown"
+  );
+}
+
+function currentEngineHeadline() {
+  return `ComfyUI: ${currentComfyUiVersion()} (${gpuShortLabel()})`;
+}
+
+function switchOptionLabel(runtime) {
+  return `${currentEngineHeadline()} | ${currentPythonVersion(runtime)} | ${currentTorchVersion(runtime)} | Sage Attn: n/a`;
+}
+
+function selectedRuntimeDetail() {
+  return installedRuntimes().find((runtime) => runtime.version === state.selectedVersion) ?? liveRuntimeDetail() ?? activeRuntimeDetail() ?? null;
+}
+
+function collapsedSummaryLabel() {
+  return switchOptionLabel(selectedRuntimeDetail() ?? {});
 }
 
 function switchButtonLabel() {
+  if (state.mode === "reconnect_wait" || (state.mode === "switch_pending" && state.switchOperation === "restart")) {
+    return "Restarting";
+  }
   if (state.mode === "switch_pending") {
-    return "Switching...";
+    return "Switching";
   }
-  if (state.mode === "reconnect_wait") {
-    return "Reconnecting...";
-  }
-  return "Switch Engine";
+  return "Switch";
 }
 
-function switchDetailText(runtimes, currentActiveVersion) {
-  if (runtimes.length < 2) {
-    return "Install another managed runtime to test live engine switching from inside ComfyUI.";
+function progressHeadline() {
+  if (state.mode === "reconnect_wait" || (state.mode === "switch_pending" && state.switchOperation === "restart")) {
+    return "Restarting engine";
   }
-  if (state.selectedVersion === currentActiveVersion) {
-    return "Choose a different installed runtime version to switch engines.";
-  }
-  return "Switches are executed by the VKTRFLO host service. This panel only mirrors that control plane.";
-}
-
-function progressTitle() {
-  const targetVersion = state.switchTargetVersion ?? "target engine";
   if (state.mode === "switch_pending") {
-    return `Starting ${targetVersion}`;
+    return "Switching engine";
   }
-  if (state.mode === "reconnect_wait") {
-    return `Waiting for ${targetVersion}`;
-  }
-  return `Switch to ${targetVersion} failed`;
+  return "Engine switch needs attention";
 }
 
 async function fetchJson(url) {
   const response = await fetch(url, {
     method: "GET",
-    headers: {
-      Accept: "application/json",
-    },
+    headers: { Accept: "application/json" },
   });
-
   const payload = await response.json().catch(() => null);
   if (!response.ok) {
-    const message = payload?.error?.message ?? `Request failed for ${url}`;
-    throw new Error(message);
+    throw new Error(payload?.error?.message ?? `Request failed for ${url}`);
   }
   return payload;
 }
@@ -461,11 +536,9 @@ async function postJson(url, payload) {
     },
     body: JSON.stringify(payload),
   });
-
   const responsePayload = await response.json().catch(() => null);
   if (!response.ok) {
-    const message = responsePayload?.error?.message ?? `Request failed for ${url}`;
-    throw new Error(message);
+    throw new Error(responsePayload?.error?.message ?? `Request failed for ${url}`);
   }
   return responsePayload;
 }
@@ -482,8 +555,7 @@ async function hydrateRuntimeState() {
   state.systemStats = systemStats;
   state.lastUpdatedAt = new Date().toISOString();
   synchronizeSelectedVersion();
-
-  return { startupState, runtimeStatus, systemStats };
+  return { startupState };
 }
 
 async function refreshPanel() {
@@ -503,7 +575,6 @@ async function refreshPanel() {
         || hostReportsTargetReady(state.switchTargetVersion)
       ) {
         const targetVersion = state.switchTargetVersion;
-        state.switchMessage = `Engine ${targetVersion} is ready.`;
         resetSwitchState();
         setMode("ready");
         reloadAfterConfirmedSwitch(targetVersion);
@@ -511,11 +582,7 @@ async function refreshPanel() {
       }
 
       if (startupState?.runtime_process_status === "error") {
-        const hostMessage = startupState?.runtime_process_message ?? "Host reported an engine error during reconnect.";
-        state.error = hostMessage;
-        state.lastReconnectError = hostMessage;
-        setMode("error");
-        return;
+        throw new Error(startupState?.runtime_process_message ?? "Host reported an engine error during reconnect.");
       }
 
       persistSwitchState();
@@ -557,7 +624,6 @@ async function waitForRuntimeReconnect(targetVersion) {
         (startupState?.runtime_process_status === "ready" && liveVersion === targetVersion)
         || hostReportsTargetReady(targetVersion)
       ) {
-        state.switchMessage = `Engine ${targetVersion} is ready.`;
         resetSwitchState();
         setMode("ready");
         reloadAfterConfirmedSwitch(targetVersion);
@@ -565,7 +631,7 @@ async function waitForRuntimeReconnect(targetVersion) {
       }
 
       if (startupState?.runtime_process_status === "ready" && liveVersion && liveVersion !== targetVersion) {
-        state.lastReconnectError = `Live engine is still ${liveVersion}. Waiting for ${targetVersion}.`;
+        state.lastReconnectError = `Live engine is still ${switchOptionLabel(liveRuntimeDetail() ?? {})}.`;
       }
     } catch (error) {
       state.lastReconnectError = error instanceof Error ? error.message : String(error);
@@ -576,28 +642,60 @@ async function waitForRuntimeReconnect(targetVersion) {
     await new Promise((resolve) => window.setTimeout(resolve, RECONNECT_INTERVAL_MS));
   }
 
-  throw new Error(`Timed out waiting for engine ${targetVersion} to become ready.`);
+  throw new Error(`Timed out waiting for ${targetVersion} to become ready.`);
 }
 
 async function switchEngine() {
   const version = state.selectedVersion;
-  const profile = selectedProfileDetail();
-
   if (!version) {
     return;
   }
 
   state.error = null;
-  state.switchMessage = `Requesting engine switch to ${version}.`;
+  state.switchOperation = "switch";
   state.switchTargetVersion = version;
   state.switchStartedAt = new Date().toISOString();
   state.lastReconnectError = null;
+  state.switchMessage = `Requesting ${version}.`;
   persistSwitchState();
   setMode("switch_pending");
 
   try {
-    await postJson(serviceUrl(SWITCH_AND_START_PATH), { profile, version });
-    state.switchMessage = `Switch accepted. Waiting for ${version} to reconnect.`;
+    await postJson(serviceUrl(SWITCH_AND_START_PATH), {
+      profile: selectedProfileDetail(),
+      version,
+    });
+    state.switchMessage = `Switch accepted. Waiting for ${version}.`;
+    persistSwitchState();
+    setMode("reconnect_wait");
+    await waitForRuntimeReconnect(version);
+  } catch (error) {
+    state.error = error instanceof Error ? error.message : String(error);
+    state.lastReconnectError = state.error;
+    persistSwitchState();
+    setMode("error");
+  }
+}
+
+async function restartCurrentEngine() {
+  const version = deriveLiveRuntimeVersion() ?? activeVersion() ?? state.selectedVersion;
+  if (!version) {
+    return;
+  }
+
+  state.error = null;
+  state.switchOperation = "restart";
+  state.switchTargetVersion = version;
+  state.switchStartedAt = new Date().toISOString();
+  state.lastReconnectError = null;
+  state.switchMessage = `Restarting ${version}.`;
+  persistSwitchState();
+  setMode("switch_pending");
+
+  try {
+    await postJson(serviceUrl(RUNTIME_STOP_PATH), {});
+    await postJson(serviceUrl(RUNTIME_START_PATH), {});
+    state.switchMessage = `Restart accepted. Waiting for ${version}.`;
     persistSwitchState();
     setMode("reconnect_wait");
     await waitForRuntimeReconnect(version);
@@ -611,9 +709,15 @@ async function switchEngine() {
 
 function createElement(tag, options = {}) {
   const el = document.createElement(tag);
-  if (options.className) el.className = options.className;
-  if (options.text) el.textContent = options.text;
-  if (options.html) el.innerHTML = options.html;
+  if (options.className) {
+    el.className = options.className;
+  }
+  if (options.text != null) {
+    el.textContent = options.text;
+  }
+  if (options.html != null) {
+    el.innerHTML = options.html;
+  }
   if (options.attrs) {
     for (const [key, value] of Object.entries(options.attrs)) {
       if (value != null) {
@@ -624,9 +728,79 @@ function createElement(tag, options = {}) {
   return el;
 }
 
-function ensurePanel() {
-  if (panelEl) return;
+function clampPanelPosition() {
+  if (!panelEl) {
+    return;
+  }
 
+  const margin = 12;
+  const width = panelEl.offsetWidth || 360;
+  const height = panelEl.offsetHeight || 180;
+  const maxLeft = Math.max(margin, window.innerWidth - width - margin);
+  const maxTop = Math.max(margin, window.innerHeight - height - margin);
+
+  if (state.panelUi.left == null) {
+    state.panelUi.left = maxLeft;
+  } else {
+    state.panelUi.left = Math.min(Math.max(margin, state.panelUi.left), maxLeft);
+  }
+  state.panelUi.top = Math.min(Math.max(margin, state.panelUi.top), maxTop);
+}
+
+function applyPanelPosition() {
+  if (!panelEl) {
+    return;
+  }
+  clampPanelPosition();
+  panelEl.style.left = `${state.panelUi.left}px`;
+  panelEl.style.top = `${state.panelUi.top}px`;
+}
+
+function endDrag() {
+  if (!dragState) {
+    return;
+  }
+  dragState = null;
+  window.removeEventListener("pointermove", handleDragMove);
+  window.removeEventListener("pointerup", endDrag);
+  panelEl?.classList.remove("vktrflo-env-switcher--dragging");
+  persistPanelUiState();
+}
+
+function handleDragMove(event) {
+  if (!dragState) {
+    return;
+  }
+  state.panelUi.left = dragState.startLeft + (event.clientX - dragState.pointerStartX);
+  state.panelUi.top = dragState.startTop + (event.clientY - dragState.pointerStartY);
+  applyPanelPosition();
+}
+
+function beginDrag(event) {
+  if (event.button !== 0) {
+    return;
+  }
+  dragState = {
+    pointerStartX: event.clientX,
+    pointerStartY: event.clientY,
+    startLeft: state.panelUi.left ?? 0,
+    startTop: state.panelUi.top ?? 0,
+  };
+  panelEl?.classList.add("vktrflo-env-switcher--dragging");
+  window.addEventListener("pointermove", handleDragMove);
+  window.addEventListener("pointerup", endDrag);
+}
+
+function toggleCollapsed() {
+  state.panelUi.collapsed = !state.panelUi.collapsed;
+  persistPanelUiState();
+  render();
+}
+
+function ensurePanel() {
+  if (panelEl) {
+    return;
+  }
   ensureStyles();
   panelEl = createElement("aside", {
     className: "vktrflo-env-switcher",
@@ -635,117 +809,59 @@ function ensurePanel() {
   document.body.appendChild(panelEl);
 }
 
-function ensureToggle() {
-  if (toggleEl) return;
-
-  toggleEl = createElement("button", {
-    className: "vktrflo-env-switcher__toggle",
-    text: "VKTRFLO",
-    attrs: { id: TOGGLE_ID, type: "button" },
+function renderCollapsedBody(container) {
+  const body = createElement("button", {
+    className: "vktrflo-env-switcher__collapsed",
+    attrs: { type: "button" },
   });
-  toggleEl.onclick = () => {
-    state.visible = !state.visible;
-    render();
-  };
-
-  const comfyMenu = document.querySelector(".comfy-menu");
-  if (comfyMenu) {
-    comfyMenu.appendChild(toggleEl);
-  } else {
-    Object.assign(toggleEl.style, {
-      position: "fixed",
-      top: "1rem",
-      right: "1rem",
-      zIndex: "91",
-    });
-    document.body.appendChild(toggleEl);
-  }
-}
-
-function renderInstalledRuntimes(container) {
-  const runtimes = sortedInstalledRuntimes();
-  const section = createElement("section", { className: "vktrflo-env-switcher__grid" });
-  section.appendChild(createElement("div", {
-    className: "vktrflo-env-switcher__section-title",
-    text: "Installed Engines",
+  body.onclick = () => toggleCollapsed();
+  body.appendChild(createElement("span", {
+    className: "vktrflo-env-switcher__collapsed-engine",
+    text: collapsedSummaryLabel(),
   }));
-
-  if (runtimes.length === 0) {
-    section.appendChild(createElement("p", {
-      className: "vktrflo-env-switcher__empty",
-      text: "No installed managed runtimes were reported for the selected profile.",
-    }));
-    container.appendChild(section);
-    return;
-  }
-
-  const currentLiveVersion = deriveLiveRuntimeVersion();
-  const wrap = createElement("div", { className: "vktrflo-env-switcher__table-wrap" });
-  const table = createElement("table", { className: "vktrflo-env-switcher__table" });
-  table.innerHTML = `
-    <thead>
-      <tr>
-        <th>Version</th>
-        <th>Status</th>
-        <th>Python</th>
-        <th>CUDA</th>
-        <th>PyTorch</th>
-      </tr>
-    </thead>
-    <tbody></tbody>
-  `;
-
-  const tbody = table.querySelector("tbody");
-  for (const runtime of runtimes) {
-    const row = document.createElement("tr");
-    row.dataset.active = String(runtime.version === currentLiveVersion);
-    row.innerHTML = `
-      <td>${runtime.version ?? "Unknown"}</td>
-      <td>${runtime.status ?? "Unknown"}</td>
-      <td>${runtime.python_version ?? "Unknown"}</td>
-      <td>${runtime.cuda_version ?? "n/a"}</td>
-      <td>${runtime.torch_version ?? "Unknown"}</td>
-    `;
-    tbody.appendChild(row);
-  }
-
-  wrap.appendChild(table);
-  section.appendChild(wrap);
-  container.appendChild(section);
+  container.appendChild(body);
 }
 
-function renderSwitchControls(container) {
-  const runtimes = sortedInstalledRuntimes();
-  const currentActiveVersion = deriveLiveRuntimeVersion() ?? activeVersion();
-  const selectDisabled = runtimes.length === 0 || isSwitchInFlight();
-  const switchDisabled = !state.selectedVersion
-    || runtimes.length === 0
-    || selectDisabled
-    || state.selectedVersion === currentActiveVersion;
+function renderFact(container, label, value) {
+  const row = createElement("div", { className: "vktrflo-env-switcher__fact" });
+  row.appendChild(createElement("span", {
+    className: "vktrflo-env-switcher__fact-label",
+    text: label,
+  }));
+  row.appendChild(createElement("span", {
+    className: "vktrflo-env-switcher__fact-value",
+    text: value,
+  }));
+  container.appendChild(row);
+}
 
-  const section = createElement("section", { className: "vktrflo-env-switcher__grid" });
-  section.appendChild(createElement("div", {
+function renderExpandedBody(container, runtime) {
+  const switchCard = createElement("section", { className: "vktrflo-env-switcher__card" });
+  switchCard.appendChild(createElement("label", {
     className: "vktrflo-env-switcher__section-title",
-    text: "Engine Switch",
+    text: "Switch To",
+    attrs: { for: "vktrflo-env-switcher-select" },
   }));
 
   const controls = createElement("div", { className: "vktrflo-env-switcher__controls" });
+  const runtimes = sortedInstalledRuntimes();
+  const currentVersion = deriveLiveRuntimeVersion() ?? activeVersion();
   const select = createElement("select", {
     className: "vktrflo-env-switcher__select",
-    attrs: { "aria-label": "Select installed engine version" },
+    attrs: { id: "vktrflo-env-switcher-select", "aria-label": "Switch to engine" },
   });
-  select.disabled = selectDisabled;
+  select.disabled = isSwitchInFlight() || runtimes.length === 0;
   select.onchange = (event) => {
     state.selectedVersion = event.target.value;
-    state.switchMessage = null;
+    persistPanelUiState();
     render();
   };
 
-  for (const runtime of runtimes) {
+  for (const runtimeOption of runtimes) {
     const option = document.createElement("option");
-    option.value = runtime.version ?? "";
-    option.textContent = `${runtime.version ?? "Unknown"}${runtime.version === currentActiveVersion ? " (current)" : ""}`;
-    option.selected = runtime.version === state.selectedVersion;
+    option.value = runtimeOption.version ?? "";
+    option.textContent = `${switchOptionLabel(runtimeOption)}${runtimeOption.version === currentVersion ? " (Current)" : ""}`;
+    option.selected = runtimeOption.version === state.selectedVersion;
     select.appendChild(option);
   }
 
@@ -754,226 +870,162 @@ function renderSwitchControls(container) {
     text: switchButtonLabel(),
     attrs: { type: "button" },
   });
-  switchButton.disabled = switchDisabled;
+  switchButton.disabled = !state.selectedVersion || isSwitchInFlight() || state.selectedVersion === currentVersion;
   switchButton.onclick = () => {
     void switchEngine();
   };
 
   controls.appendChild(select);
   controls.appendChild(switchButton);
-  section.appendChild(controls);
+  switchCard.appendChild(controls);
+  container.appendChild(switchCard);
 
-  section.appendChild(createElement("p", {
-    className: "vktrflo-env-switcher__detail",
-    text: switchDetailText(runtimes, currentActiveVersion),
+  const card = createElement("section", { className: "vktrflo-env-switcher__card" });
+  card.appendChild(createElement("div", {
+    className: "vktrflo-env-switcher__section-title",
+    text: "Current Engine",
   }));
 
-  if (state.switchMessage) {
-    section.appendChild(createElement("p", {
-      className: "vktrflo-env-switcher__notice",
-      text: state.switchMessage,
-      attrs: {
-        "data-tone": state.mode === "error" ? "error" : state.mode === "ready" ? "ready" : "loading",
-      },
-    }));
-  }
+  const facts = createElement("div", { className: "vktrflo-env-switcher__facts" });
+  renderFact(facts, "Current Engine", currentEngineHeadline());
+  renderFact(facts, "Python", currentPythonVersion(runtime));
+  renderFact(facts, "PyTorch", currentTorchVersion(runtime));
+  renderFact(facts, "Sage Attn", "n/a");
+  renderFact(facts, "Last Started", formatTimestamp(runtime?.last_launched_at));
+  card.appendChild(facts);
+  container.appendChild(card);
 
-  if (isSwitchInFlight() || (state.mode === "error" && state.switchTargetVersion)) {
-    const progress = createElement("div", {
+  if (isSwitchInFlight()) {
+    const progress = createElement("section", {
       className: "vktrflo-env-switcher__progress",
-      attrs: { "data-tone": state.mode === "error" ? "error" : "loading" },
+      attrs: { "data-tone": "loading" },
     });
-
     progress.appendChild(createElement("div", {
       className: "vktrflo-env-switcher__progress-title",
-      text: progressTitle(),
+      text: progressHeadline(),
     }));
-
-    const progressMeta = createElement("div", { className: "vktrflo-env-switcher__progress-meta" });
-    progressMeta.appendChild(createElement("span", {
+    progress.appendChild(createElement("div", {
+      className: "vktrflo-env-switcher__progress-meta",
       text: `Elapsed ${formatElapsedSince(state.switchStartedAt)}`,
     }));
-    progress.appendChild(progressMeta);
-
-    if (state.mode !== "error") {
-      progress.appendChild(createElement("div", {
-        className: "vktrflo-env-switcher__progress-bar",
-        html: '<span class="vktrflo-env-switcher__progress-fill"></span>',
-      }));
-    }
-
-    if (state.lastReconnectError && state.mode !== "ready") {
-      progress.appendChild(createElement("p", {
-        className: "vktrflo-env-switcher__detail",
-        text: `Last reconnect signal: ${state.lastReconnectError}`,
-      }));
-    }
-
-    if (state.switchTargetVersion) {
-      const progressActions = createElement("div", { className: "vktrflo-env-switcher__error-actions" });
-      const resetButton = createElement("button", {
-        className: "vktrflo-env-switcher__button",
-        text: "Reset Panel State",
-        attrs: { type: "button" },
-      });
-      resetButton.onclick = () => {
-        state.error = null;
-        resetSwitchState();
-        void refreshPanel();
-      };
-      progressActions.appendChild(resetButton);
-      progress.appendChild(progressActions);
-    }
-
-    section.appendChild(progress);
+    progress.appendChild(createElement("div", {
+      className: "vktrflo-env-switcher__progress-bar",
+      html: '<span class="vktrflo-env-switcher__progress-fill"></span>',
+    }));
+    container.appendChild(progress);
   }
 
-  container.appendChild(section);
+  if (state.error) {
+    const errorCard = createElement("section", { className: "vktrflo-env-switcher__error-card" });
+    errorCard.appendChild(createElement("div", {
+      className: "vktrflo-env-switcher__section-title",
+      text: "Error",
+    }));
+    errorCard.appendChild(createElement("p", {
+      className: "vktrflo-env-switcher__error-text",
+      text: state.error,
+    }));
+    const actions = createElement("div", { className: "vktrflo-env-switcher__actions" });
+    const retryButton = createElement("button", {
+      className: "vktrflo-env-switcher__button",
+      text: "Retry",
+      attrs: { type: "button" },
+    });
+    retryButton.onclick = () => {
+      state.error = null;
+      if (state.switchTargetVersion) {
+        setMode("reconnect_wait");
+        void waitForRuntimeReconnect(state.switchTargetVersion).catch((error) => {
+          state.error = error instanceof Error ? error.message : String(error);
+          state.lastReconnectError = state.error;
+          persistSwitchState();
+          setMode("error");
+        });
+        return;
+      }
+      void refreshPanel();
+    };
+    const resetButton = createElement("button", {
+      className: "vktrflo-env-switcher__button",
+      text: "Reset Panel",
+      attrs: { type: "button" },
+    });
+    resetButton.onclick = () => {
+      state.error = null;
+      resetSwitchState();
+      void refreshPanel();
+    };
+    actions.appendChild(retryButton);
+    actions.appendChild(resetButton);
+    errorCard.appendChild(actions);
+    container.appendChild(errorCard);
+  }
 }
 
 function render() {
   ensurePanel();
-  ensureToggle();
 
-  panelEl.hidden = !state.visible;
-  toggleEl.textContent = state.visible ? "Hide VKTRFLO" : "Show VKTRFLO";
-
-  const runtimeStatus = state.startupState?.runtime_process_status ?? "idle";
-  const tone = toneForRuntimeStatus(runtimeStatus);
-  const activeRuntime = activeRuntimeDetail();
-  const liveRuntime = liveRuntimeDetail();
-  const liveVersion = liveRuntime?.version ?? deriveLiveRuntimeVersion() ?? "Unknown";
-  const livePythonVersion = systemStatsPythonVersion() ?? "Unknown";
-
+  const runtime = liveRuntimeDetail() ?? activeRuntimeDetail() ?? { python_version: state.systemStats?.system?.python_version };
+  panelEl.className = `vktrflo-env-switcher${state.panelUi.collapsed ? " vktrflo-env-switcher--collapsed" : ""}`;
   panelEl.innerHTML = "";
 
   const header = createElement("div", { className: "vktrflo-env-switcher__header" });
-  const headerCopy = createElement("div");
-  headerCopy.appendChild(createElement("div", {
-    className: "vktrflo-env-switcher__eyebrow",
-    text: "VKTRFLO Env Switcher",
-  }));
-  headerCopy.appendChild(createElement("h2", {
-    className: "vktrflo-env-switcher__title",
-    text: "Managed Runtime Panel",
-  }));
-  headerCopy.appendChild(createElement("p", {
-    className: "vktrflo-env-switcher__subcopy",
-    text: "Thin ComfyUI wrapper around the VKTRFLO host service. The host owns engine lifecycle; this panel only drives it.",
-  }));
-  header.appendChild(headerCopy);
+  header.onpointerdown = (event) => beginDrag(event);
 
-  const refreshButton = createElement("button", {
-    className: "vktrflo-env-switcher__button",
-    text: refreshButtonLabel(),
-    attrs: { type: "button" },
+  const titleWrap = createElement("div", { className: "vktrflo-env-switcher__title-wrap" });
+  titleWrap.appendChild(createElement("div", {
+    className: "vktrflo-env-switcher__eyebrow",
+    text: "VKTRFLO",
+  }));
+  titleWrap.appendChild(createElement("h2", {
+    className: "vktrflo-env-switcher__title",
+    text: state.panelUi.collapsed ? "Engine" : "Engine Switcher",
+  }));
+  header.appendChild(titleWrap);
+
+  const headerActions = createElement("div", { className: "vktrflo-env-switcher__header-actions" });
+  const restartButton = createElement("button", {
+    className: "vktrflo-env-switcher__button vktrflo-env-switcher__button--header",
+    text: state.mode === "reconnect_wait" || (state.mode === "switch_pending" && state.switchOperation === "restart") ? "Restarting" : "Restart",
+    attrs: { type: "button", "aria-label": "Restart current engine" },
   });
-  refreshButton.disabled = state.mode === "loading" || state.mode === "bootstrapping" || state.mode === "switch_pending";
-  refreshButton.onclick = () => {
-    void refreshPanel();
+  restartButton.disabled = isSwitchInFlight();
+  restartButton.onclick = () => {
+    void restartCurrentEngine();
   };
-  header.appendChild(refreshButton);
+  headerActions.appendChild(restartButton);
+  const collapseButton = createElement("button", {
+    className: "vktrflo-env-switcher__icon-button",
+    html: `<span class="ready-title-caret" aria-hidden="true">${state.panelUi.collapsed ? "▾" : "▴"}</span>`,
+    attrs: { type: "button", "aria-label": state.panelUi.collapsed ? "Expand panel" : "Collapse panel" },
+  });
+  collapseButton.onclick = () => toggleCollapsed();
+  headerActions.appendChild(collapseButton);
+  header.appendChild(headerActions);
   panelEl.appendChild(header);
 
-  const service = createElement("div", { className: "vktrflo-env-switcher__service" });
-  service.appendChild(createElement("div", {
-    className: "vktrflo-env-switcher__detail",
-    text: state.error ? "VKTRFLO host unavailable" : `Host service: ${state.serviceBaseUrl ?? defaultServiceBaseUrl()}`,
-  }));
-  const badge = createElement("div", {
-    className: "vktrflo-env-switcher__badge",
-    text: state.error ? "Panel Error" : labelForRuntimeStatus(runtimeStatus),
-    attrs: { "data-tone": state.error ? "error" : tone },
-  });
-  service.appendChild(badge);
-  panelEl.appendChild(service);
-
-  if (state.error) {
-    panelEl.appendChild(createElement("p", {
-      className: "vktrflo-env-switcher__error",
-      text: state.error,
-    }));
-    if (state.switchTargetVersion) {
-      const retryWrap = createElement("div", { className: "vktrflo-env-switcher__error-actions" });
-      const retryButton = createElement("button", {
-        className: "vktrflo-env-switcher__button",
-        text: "Retry Poll",
-        attrs: { type: "button" },
-      });
-      retryButton.onclick = () => {
-        state.error = null;
-        setMode("reconnect_wait");
-        void waitForRuntimeReconnect(state.switchTargetVersion);
-      };
-      const clearButton = createElement("button", {
-        className: "vktrflo-env-switcher__button",
-        text: "Dismiss Switch State",
-        attrs: { type: "button" },
-      });
-      clearButton.onclick = () => {
-        state.error = null;
-        resetSwitchState();
-        void refreshPanel();
-      };
-      retryWrap.appendChild(retryButton);
-      retryWrap.appendChild(clearButton);
-      panelEl.appendChild(retryWrap);
-    }
+  if (state.panelUi.collapsed) {
+    renderCollapsedBody(panelEl);
   } else {
-    const active = createElement("section", { className: "vktrflo-env-switcher__active" });
-    const facts = createElement("div", { className: "vktrflo-env-switcher__facts" });
-    facts.appendChild(createElement("div", {
-      className: "vktrflo-env-switcher__section-title",
-      text: "Active Engine",
-    }));
-
-    const factRows = [
-      ["Profile", String(selectedProfileDetail()).toUpperCase()],
-      ["Live Engine Version", liveVersion],
-      ["Selected Version", activeRuntime?.version ?? "Unknown"],
-      ["Live Python", livePythonVersion],
-      ["Process State", runtimeStatus],
-      ["Message", state.startupState?.runtime_process_message ?? "No message"],
-      ["Last Launched", formatTimestamp(liveRuntime?.last_launched_at ?? activeRuntime?.last_launched_at)],
-    ];
-
-    for (const [label, value] of factRows) {
-      const row = createElement("div", { className: "vktrflo-env-switcher__fact" });
-      row.appendChild(createElement("span", {
-        className: "vktrflo-env-switcher__fact-label",
-        text: label,
-      }));
-      row.appendChild(createElement("span", {
-        className: "vktrflo-env-switcher__fact-value",
-        text: value,
-      }));
-      facts.appendChild(row);
-    }
-
-    active.appendChild(facts);
-    panelEl.appendChild(active);
-    renderSwitchControls(panelEl);
-    renderInstalledRuntimes(panelEl);
+    renderExpandedBody(panelEl, runtime);
   }
 
-  const footer = createElement("div", { className: "vktrflo-env-switcher__footer" });
-  footer.appendChild(createElement("span", {
-    text: state.lastUpdatedAt ? `Last updated ${formatTimestamp(state.lastUpdatedAt)}` : "Waiting for first hydrate",
-  }));
-  footer.appendChild(createElement("span", {
-    text: humanModeLabel(state.mode),
-  }));
-  panelEl.appendChild(footer);
+  applyPanelPosition();
 }
 
 function mountWhenReady() {
   consumePostSwitchReloadMarker();
+  restorePanelUiState();
   restoreSwitchState();
   syncProgressRenderTimer();
   ensurePanel();
-  ensureToggle();
   render();
+  window.addEventListener("resize", () => {
+    applyPanelPosition();
+    persistPanelUiState();
+  });
   void refreshPanel();
+
   if (state.switchTargetVersion) {
     void waitForRuntimeReconnect(state.switchTargetVersion).catch((error) => {
       state.error = error instanceof Error ? error.message : String(error);

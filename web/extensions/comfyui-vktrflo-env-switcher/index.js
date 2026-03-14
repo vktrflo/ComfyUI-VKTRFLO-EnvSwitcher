@@ -2,16 +2,18 @@ import { app } from "/scripts/app.js";
 
 const EXTENSION_NAME = "vktrflo.env-switcher";
 const HOST_API_PORT = "38431";
+const HOST_UI_PORT = "5173";
 const STARTUP_STATE_PATH = "/api/v1/startup-state";
 const RUNTIME_STATUS_PATH = "/api/v1/runtime/status";
 const SWITCH_AND_START_PATH = "/api/v1/runtime/switch-and-start";
 const RUNTIME_START_PATH = "/api/v1/runtime/start";
 const RUNTIME_STOP_PATH = "/api/v1/runtime/stop";
+const OPEN_ACTIVE_INSTALLATION_PATH = "/api/v1/files/open/active-comfyui-installation";
 const SYSTEM_STATS_URL = "/system_stats";
 const PANEL_ID = "vktrflo-env-switcher-panel";
+const LAUNCHER_ID = "vktrflo-env-switcher-launcher";
 const SWITCH_STATE_STORAGE_KEY = "vktrflo.env-switcher.switch-state";
 const POST_SWITCH_RELOAD_STORAGE_KEY = "vktrflo.env-switcher.post-switch-reload";
-const PANEL_UI_STATE_STORAGE_KEY = "vktrflo.env-switcher.panel-ui";
 const RECONNECT_TIMEOUT_MS = 90000;
 const RECONNECT_INTERVAL_MS = 2000;
 
@@ -29,17 +31,15 @@ const state = {
   switchTargetVersion: null,
   switchStartedAt: null,
   lastReconnectError: null,
-  panelUi: {
-    collapsed: false,
-    top: 84,
-    left: null,
-    selectedVersion: null,
-  },
+  panelOpen: false,
 };
 
 let panelEl;
+let overlayEl;
+let launcherButtonEl;
+let toastHostEl;
 let progressRenderTimer = null;
-let dragState = null;
+let toastTimer = null;
 
 function isSwitchInFlight(mode = state.mode) {
   return mode === "switch_pending" || mode === "reconnect_wait";
@@ -72,6 +72,20 @@ function defaultServiceBaseUrl() {
   const protocol = window.location.protocol === "https:" ? "https:" : "http:";
   const hostname = window.location.hostname || "127.0.0.1";
   return `${protocol}//${hostname}:${HOST_API_PORT}`;
+}
+
+function defaultHostUiUrl() {
+  const protocol = window.location.protocol === "https:" ? "https:" : "http:";
+  const hostname = window.location.hostname || "127.0.0.1";
+  return `${protocol}//${hostname}:${HOST_UI_PORT}`;
+}
+
+function truncateInstallPath(path) {
+  const normalized = String(path ?? "").trim();
+  if (!normalized) {
+    return "Unknown";
+  }
+  return normalized.length <= 34 ? normalized : `...${normalized.slice(-34)}`;
 }
 
 function resolveServiceBaseUrl() {
@@ -153,40 +167,6 @@ function resetSwitchState() {
   state.lastReconnectError = null;
   persistSwitchState();
   syncProgressRenderTimer();
-}
-
-function persistPanelUiState() {
-  try {
-    state.panelUi.selectedVersion = state.selectedVersion;
-    window.localStorage.setItem(PANEL_UI_STATE_STORAGE_KEY, JSON.stringify(state.panelUi));
-  } catch (_error) {
-    // Ignore storage failures.
-  }
-}
-
-function restorePanelUiState() {
-  try {
-    const raw = window.localStorage.getItem(PANEL_UI_STATE_STORAGE_KEY);
-    if (!raw) {
-      return;
-    }
-    const persisted = JSON.parse(raw);
-    if (typeof persisted?.collapsed === "boolean") {
-      state.panelUi.collapsed = persisted.collapsed;
-    }
-    if (Number.isFinite(persisted?.top)) {
-      state.panelUi.top = persisted.top;
-    }
-    if (persisted?.left == null || Number.isFinite(persisted.left)) {
-      state.panelUi.left = persisted.left ?? null;
-    }
-    if (typeof persisted?.selectedVersion === "string" || persisted?.selectedVersion == null) {
-      state.panelUi.selectedVersion = persisted.selectedVersion ?? null;
-      state.selectedVersion = persisted.selectedVersion ?? null;
-    }
-  } catch (_error) {
-    window.localStorage.removeItem(PANEL_UI_STATE_STORAGE_KEY);
-  }
 }
 
 function markPostSwitchReload(targetVersion) {
@@ -350,11 +330,9 @@ function synchronizeSelectedVersion() {
   const runtimes = sortedInstalledRuntimes();
   const versions = new Set(runtimes.map((runtime) => runtime.version).filter(Boolean));
   if (state.selectedVersion && versions.has(state.selectedVersion)) {
-    persistPanelUiState();
     return;
   }
   state.selectedVersion = activeVersion() ?? runtimes[0]?.version ?? null;
-  persistPanelUiState();
 }
 
 function formatTimestamp(value) {
@@ -487,14 +465,6 @@ function switchOptionLabel(runtime) {
   return `${currentEngineHeadline()} | ${currentPythonVersion(runtime)} | ${currentTorchVersion(runtime)} | Sage Attn: n/a`;
 }
 
-function selectedRuntimeDetail() {
-  return installedRuntimes().find((runtime) => runtime.version === state.selectedVersion) ?? liveRuntimeDetail() ?? activeRuntimeDetail() ?? null;
-}
-
-function collapsedSummaryLabel() {
-  return switchOptionLabel(selectedRuntimeDetail() ?? {});
-}
-
 function switchButtonLabel() {
   if (state.mode === "reconnect_wait" || (state.mode === "switch_pending" && state.switchOperation === "restart")) {
     return "Restarting";
@@ -541,6 +511,22 @@ async function postJson(url, payload) {
     throw new Error(responsePayload?.error?.message ?? `Request failed for ${url}`);
   }
   return responsePayload;
+}
+
+async function postNoContent(url) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({}),
+  });
+
+  if (!response.ok) {
+    const responsePayload = await response.json().catch(() => null);
+    throw new Error(responsePayload?.error?.message ?? `Request failed for ${url}`);
+  }
 }
 
 async function hydrateRuntimeState() {
@@ -728,73 +714,12 @@ function createElement(tag, options = {}) {
   return el;
 }
 
-function clampPanelPosition() {
-  if (!panelEl) {
+async function copyToClipboard(value) {
+  if (typeof navigator === "undefined" || !navigator.clipboard || !value) {
     return;
   }
-
-  const margin = 12;
-  const width = panelEl.offsetWidth || 360;
-  const height = panelEl.offsetHeight || 180;
-  const maxLeft = Math.max(margin, window.innerWidth - width - margin);
-  const maxTop = Math.max(margin, window.innerHeight - height - margin);
-
-  if (state.panelUi.left == null) {
-    state.panelUi.left = maxLeft;
-  } else {
-    state.panelUi.left = Math.min(Math.max(margin, state.panelUi.left), maxLeft);
-  }
-  state.panelUi.top = Math.min(Math.max(margin, state.panelUi.top), maxTop);
-}
-
-function applyPanelPosition() {
-  if (!panelEl) {
-    return;
-  }
-  clampPanelPosition();
-  panelEl.style.left = `${state.panelUi.left}px`;
-  panelEl.style.top = `${state.panelUi.top}px`;
-}
-
-function endDrag() {
-  if (!dragState) {
-    return;
-  }
-  dragState = null;
-  window.removeEventListener("pointermove", handleDragMove);
-  window.removeEventListener("pointerup", endDrag);
-  panelEl?.classList.remove("vktrflo-env-switcher--dragging");
-  persistPanelUiState();
-}
-
-function handleDragMove(event) {
-  if (!dragState) {
-    return;
-  }
-  state.panelUi.left = dragState.startLeft + (event.clientX - dragState.pointerStartX);
-  state.panelUi.top = dragState.startTop + (event.clientY - dragState.pointerStartY);
-  applyPanelPosition();
-}
-
-function beginDrag(event) {
-  if (event.button !== 0) {
-    return;
-  }
-  dragState = {
-    pointerStartX: event.clientX,
-    pointerStartY: event.clientY,
-    startLeft: state.panelUi.left ?? 0,
-    startTop: state.panelUi.top ?? 0,
-  };
-  panelEl?.classList.add("vktrflo-env-switcher--dragging");
-  window.addEventListener("pointermove", handleDragMove);
-  window.addEventListener("pointerup", endDrag);
-}
-
-function toggleCollapsed() {
-  state.panelUi.collapsed = !state.panelUi.collapsed;
-  persistPanelUiState();
-  render();
+  await navigator.clipboard.writeText(value);
+  showToast("Copied ComfyUI installation path.", "success");
 }
 
 function ensurePanel() {
@@ -802,24 +727,122 @@ function ensurePanel() {
     return;
   }
   ensureStyles();
+  overlayEl = createElement("div", {
+    className: "vktrflo-env-switcher__overlay",
+    attrs: { "aria-hidden": "true" },
+  });
+  overlayEl.onclick = () => togglePanelVisibility(false);
+  document.body.appendChild(overlayEl);
   panelEl = createElement("aside", {
     className: "vktrflo-env-switcher",
     attrs: { id: PANEL_ID, "aria-live": "polite" },
   });
   document.body.appendChild(panelEl);
+  toastHostEl = createElement("div", {
+    className: "vktrflo-env-switcher__toast-host",
+    attrs: { "aria-live": "polite", "aria-atomic": "true" },
+  });
+  document.body.appendChild(toastHostEl);
 }
 
-function renderCollapsedBody(container) {
-  const body = createElement("button", {
-    className: "vktrflo-env-switcher__collapsed",
-    attrs: { type: "button" },
-  });
-  body.onclick = () => toggleCollapsed();
-  body.appendChild(createElement("span", {
-    className: "vktrflo-env-switcher__collapsed-engine",
-    text: collapsedSummaryLabel(),
+function showToast(message, tone = "info", durationMs = 3200) {
+  if (!toastHostEl) {
+    return;
+  }
+
+  if (toastTimer != null) {
+    window.clearTimeout(toastTimer);
+    toastTimer = null;
+  }
+
+  toastHostEl.innerHTML = "";
+  toastHostEl.appendChild(createElement("div", {
+    className: `vktrflo-env-switcher__toast vktrflo-env-switcher__toast--${tone}`,
+    text: message,
   }));
-  container.appendChild(body);
+
+  toastTimer = window.setTimeout(() => {
+    toastHostEl.innerHTML = "";
+    toastTimer = null;
+  }, durationMs);
+}
+
+function launcherIconMarkup() {
+  return `
+    <svg viewBox="0 0 64 64" aria-hidden="true" focusable="false" class="vktrflo-env-switcher__launcher-icon">
+      <rect x="1.5" y="1.5" width="61" height="61" rx="14" fill="url(#vktrflo-bg)" stroke="#29583a" />
+      <circle cx="32" cy="15" r="6.5" fill="url(#vktrflo-node)" />
+      <circle cx="17" cy="29" r="6.5" fill="url(#vktrflo-node)" />
+      <circle cx="47" cy="29" r="6.5" fill="url(#vktrflo-node)" />
+      <circle cx="32" cy="49" r="6.5" fill="url(#vktrflo-node)" />
+      <path d="M21 26.5 29 20.5M43 26.5 35 20.5M32 42V36" fill="none" stroke="#63ef94" stroke-width="2.6" stroke-linecap="round" stroke-opacity="0.95" />
+      <defs>
+        <linearGradient id="vktrflo-bg" x1="32" y1="2" x2="32" y2="62" gradientUnits="userSpaceOnUse">
+          <stop offset="0" stop-color="#101416" />
+          <stop offset="1" stop-color="#0a0d0e" />
+        </linearGradient>
+        <linearGradient id="vktrflo-node" x1="32" y1="8.5" x2="32" y2="55.5" gradientUnits="userSpaceOnUse">
+          <stop offset="0" stop-color="#63ef94" />
+          <stop offset="1" stop-color="#2fb866" />
+        </linearGradient>
+      </defs>
+    </svg>
+  `;
+}
+
+function launcherButtonClassName() {
+  return [
+    "relative inline-flex items-center justify-center gap-1 whitespace-nowrap appearance-none font-medium font-inter transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 text-muted-foreground bg-transparent hover:bg-secondary-background-hover rounded-lg p-2 text-xs side-bar-button cursor-pointer border-none",
+    "vktrflo-env-switcher__launcher-button",
+    state.panelOpen ? "vktrflo-env-switcher__launcher-button--active" : "",
+  ].filter(Boolean).join(" ");
+}
+
+function togglePanelVisibility(forceVisible = null) {
+  state.panelOpen = typeof forceVisible === "boolean" ? forceVisible : !state.panelOpen;
+  syncLauncherButton();
+  render();
+}
+
+function ensureLauncherButton() {
+  if (launcherButtonEl?.isConnected) {
+    syncLauncherButton();
+    return;
+  }
+
+  const sidebarButtons = document.querySelector("nav .side-bar-button")?.parentElement;
+  if (!sidebarButtons) {
+    return;
+  }
+
+  launcherButtonEl = createElement("button", {
+    className: launcherButtonClassName(),
+    html: `${launcherIconMarkup()}<span class="vktrflo-env-switcher__launcher-label">VKTRFLO</span>`,
+    attrs: {
+      id: LAUNCHER_ID,
+      type: "button",
+      "aria-label": "Toggle VKTRFLO Engine Switcher",
+      title: "VKTRFLO Engine Switcher",
+    },
+  });
+  launcherButtonEl.onclick = () => togglePanelVisibility();
+
+  const templatesButton = sidebarButtons.querySelector(".templates-tab-button");
+  if (templatesButton) {
+    templatesButton.insertAdjacentElement("afterend", launcherButtonEl);
+  } else {
+    sidebarButtons.appendChild(launcherButtonEl);
+  }
+
+  syncLauncherButton();
+}
+
+function syncLauncherButton() {
+  if (!launcherButtonEl) {
+    return;
+  }
+  launcherButtonEl.className = launcherButtonClassName();
+  launcherButtonEl.setAttribute("aria-pressed", String(state.panelOpen));
 }
 
 function renderFact(container, label, value) {
@@ -832,6 +855,78 @@ function renderFact(container, label, value) {
     className: "vktrflo-env-switcher__fact-value",
     text: value,
   }));
+  container.appendChild(row);
+}
+
+function renderFactLink(container, label, href, text) {
+  const row = createElement("div", { className: "vktrflo-env-switcher__fact" });
+  row.appendChild(createElement("span", {
+    className: "vktrflo-env-switcher__fact-label",
+    text: label,
+  }));
+  const link = createElement("a", {
+    className: "vktrflo-env-switcher__fact-link",
+    text,
+    attrs: {
+      href,
+      target: "_blank",
+      rel: "noreferrer noopener",
+    },
+  });
+  row.appendChild(link);
+  container.appendChild(row);
+}
+
+function renderInstallationPathActions(container, installationPath) {
+  const row = createElement("div", { className: "vktrflo-env-switcher__fact" });
+  row.appendChild(createElement("span", {
+    className: "vktrflo-env-switcher__fact-label",
+    text: "ComfyUI Installation Path",
+  }));
+
+  const actions = createElement("div", { className: "vktrflo-env-switcher__fact-actions" });
+  const openButton = createElement("button", {
+    className: "vktrflo-env-switcher__fact-link-button",
+    text: truncateInstallPath(installationPath),
+    attrs: {
+      type: "button",
+      title: installationPath || "ComfyUI installation path unavailable",
+    },
+  });
+  openButton.disabled = !installationPath;
+  openButton.onclick = () => {
+    void postNoContent(serviceUrl(OPEN_ACTIVE_INSTALLATION_PATH))
+      .then(() => {
+        showToast("Explorer will open behind the browser.", "info", 3600);
+      })
+      .catch((error) => {
+        state.error = error instanceof Error ? error.message : String(error);
+        setMode("error");
+      });
+  };
+
+  const copyButton = createElement("button", {
+    className: "vktrflo-env-switcher__copy-button",
+    html: `
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M9 9h10v12H9z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"></path>
+        <path d="M5 3h10v12H5z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"></path>
+      </svg>
+    `,
+    attrs: {
+      type: "button",
+      "aria-label": "Copy ComfyUI installation path",
+      title: "Copy full path",
+    },
+  });
+  copyButton.disabled = !installationPath;
+  copyButton.onclick = () => {
+    void copyToClipboard(installationPath);
+  };
+
+  actions.appendChild(openButton);
+  actions.appendChild(copyButton);
+  row.appendChild(actions);
   container.appendChild(row);
 }
 
@@ -853,7 +948,6 @@ function renderExpandedBody(container, runtime) {
   select.disabled = isSwitchInFlight() || runtimes.length === 0;
   select.onchange = (event) => {
     state.selectedVersion = event.target.value;
-    persistPanelUiState();
     render();
   };
 
@@ -892,6 +986,8 @@ function renderExpandedBody(container, runtime) {
   renderFact(facts, "PyTorch", currentTorchVersion(runtime));
   renderFact(facts, "Sage Attn", "n/a");
   renderFact(facts, "Last Started", formatTimestamp(runtime?.last_launched_at));
+  renderFactLink(facts, "Host UI", defaultHostUiUrl(), defaultHostUiUrl());
+  renderInstallationPathActions(facts, runtime?.engine_dir ?? activeRuntimeDetail()?.engine_dir ?? "");
   card.appendChild(facts);
   container.appendChild(card);
 
@@ -964,14 +1060,21 @@ function renderExpandedBody(container, runtime) {
 
 function render() {
   ensurePanel();
+  ensureLauncherButton();
 
   const runtime = liveRuntimeDetail() ?? activeRuntimeDetail() ?? { python_version: state.systemStats?.system?.python_version };
-  panelEl.className = `vktrflo-env-switcher${state.panelUi.collapsed ? " vktrflo-env-switcher--collapsed" : ""}`;
+  panelEl.className = "vktrflo-env-switcher";
+  panelEl.hidden = !state.panelOpen;
+  if (overlayEl) {
+    overlayEl.hidden = !state.panelOpen;
+  }
   panelEl.innerHTML = "";
 
-  const header = createElement("div", { className: "vktrflo-env-switcher__header" });
-  header.onpointerdown = (event) => beginDrag(event);
+  if (!state.panelOpen) {
+    return;
+  }
 
+  const header = createElement("div", { className: "vktrflo-env-switcher__header" });
   const titleWrap = createElement("div", { className: "vktrflo-env-switcher__title-wrap" });
   titleWrap.appendChild(createElement("div", {
     className: "vktrflo-env-switcher__eyebrow",
@@ -979,7 +1082,7 @@ function render() {
   }));
   titleWrap.appendChild(createElement("h2", {
     className: "vktrflo-env-switcher__title",
-    text: state.panelUi.collapsed ? "Engine" : "Engine Switcher",
+    text: "Engine Switcher",
   }));
   header.appendChild(titleWrap);
 
@@ -994,36 +1097,25 @@ function render() {
     void restartCurrentEngine();
   };
   headerActions.appendChild(restartButton);
-  const collapseButton = createElement("button", {
+  const closeButton = createElement("button", {
     className: "vktrflo-env-switcher__icon-button",
-    html: `<span class="ready-title-caret" aria-hidden="true">${state.panelUi.collapsed ? "▾" : "▴"}</span>`,
-    attrs: { type: "button", "aria-label": state.panelUi.collapsed ? "Expand panel" : "Collapse panel" },
+    html: '<span class="vktrflo-env-switcher__close-glyph" aria-hidden="true">✕</span>',
+    attrs: { type: "button", "aria-label": "Close VKTRFLO Engine Switcher" },
   });
-  collapseButton.onclick = () => toggleCollapsed();
-  headerActions.appendChild(collapseButton);
+  closeButton.onclick = () => togglePanelVisibility(false);
+  headerActions.appendChild(closeButton);
   header.appendChild(headerActions);
   panelEl.appendChild(header);
-
-  if (state.panelUi.collapsed) {
-    renderCollapsedBody(panelEl);
-  } else {
-    renderExpandedBody(panelEl, runtime);
-  }
-
-  applyPanelPosition();
+  renderExpandedBody(panelEl, runtime);
 }
 
 function mountWhenReady() {
   consumePostSwitchReloadMarker();
-  restorePanelUiState();
   restoreSwitchState();
   syncProgressRenderTimer();
   ensurePanel();
+  ensureLauncherButton();
   render();
-  window.addEventListener("resize", () => {
-    applyPanelPosition();
-    persistPanelUiState();
-  });
   void refreshPanel();
 
   if (state.switchTargetVersion) {

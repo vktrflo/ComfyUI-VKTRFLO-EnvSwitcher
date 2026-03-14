@@ -457,12 +457,21 @@ function currentTorchVersion(runtime) {
   );
 }
 
+function currentSageAttentionVersion(runtime) {
+  return (
+    String(runtime?.sage_attention_version ?? "").trim()
+    || String(selectedProfileRuntimeDetail()?.sage_attention_version ?? "").trim()
+    || String(state.runtimeStatus?.base_domain_sage_attention_version ?? "").trim()
+    || "Not Installed"
+  );
+}
+
 function currentEngineHeadline() {
   return `ComfyUI: ${currentComfyUiVersion()} (${gpuShortLabel()})`;
 }
 
 function switchOptionLabel(runtime) {
-  return `${currentEngineHeadline()} | ${currentPythonVersion(runtime)} | ${currentTorchVersion(runtime)} | Sage Attn: n/a`;
+  return `${currentEngineHeadline()} | ${currentPythonVersion(runtime)} | ${currentTorchVersion(runtime)} | Sage Attn: ${currentSageAttentionVersion(runtime)}`;
 }
 
 function switchButtonLabel() {
@@ -984,7 +993,7 @@ function renderExpandedBody(container, runtime) {
   renderFact(facts, "Current Engine", currentEngineHeadline());
   renderFact(facts, "Python", currentPythonVersion(runtime));
   renderFact(facts, "PyTorch", currentTorchVersion(runtime));
-  renderFact(facts, "Sage Attn", "n/a");
+  renderFact(facts, "Sage Attn", currentSageAttentionVersion(runtime));
   renderFact(facts, "Last Started", formatTimestamp(runtime?.last_launched_at));
   renderFactLink(facts, "Host UI", defaultHostUiUrl(), defaultHostUiUrl());
   renderInstallationPathActions(facts, runtime?.engine_dir ?? activeRuntimeDetail()?.engine_dir ?? "");

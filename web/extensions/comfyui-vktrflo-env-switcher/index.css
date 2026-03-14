@@ -233,11 +233,64 @@
   color: #efb0b0;
 }
 
+.vktrflo-env-switcher__error-actions {
+  display: flex;
+  gap: 0.65rem;
+  flex-wrap: wrap;
+}
+
 .vktrflo-env-switcher__notice {
   padding: 0.85rem;
   border: 1px solid #3f524f;
   border-radius: 14px;
   background: rgba(16, 24, 25, 0.78);
+}
+
+.vktrflo-env-switcher__progress {
+  display: grid;
+  gap: 0.55rem;
+  padding: 0.85rem;
+  border: 1px solid #425457;
+  border-radius: 14px;
+  background: rgba(15, 21, 22, 0.82);
+}
+
+.vktrflo-env-switcher__progress[data-tone="loading"] {
+  border-color: #6c6127;
+}
+
+.vktrflo-env-switcher__progress[data-tone="error"] {
+  border-color: #7f3a3a;
+}
+
+.vktrflo-env-switcher__progress-title {
+  color: #edf4f2;
+  font-size: 0.82rem;
+}
+
+.vktrflo-env-switcher__progress-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+  color: #8fa49f;
+  font-size: 0.72rem;
+}
+
+.vktrflo-env-switcher__progress-bar {
+  overflow: hidden;
+  height: 0.5rem;
+  border-radius: 999px;
+  background: rgba(28, 36, 37, 0.96);
+  border: 1px solid rgba(74, 89, 92, 0.7);
+}
+
+.vktrflo-env-switcher__progress-fill {
+  display: block;
+  width: 36%;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #7db69a 0%, #d4e99a 100%);
+  animation: vktrflo-env-switcher-progress 1.35s ease-in-out infinite;
 }
 
 .vktrflo-env-switcher__notice[data-tone="loading"] {
@@ -258,6 +311,15 @@
 .vktrflo-env-switcher__footer {
   color: #8ca39d;
   font-size: 0.74rem;
+}
+
+@keyframes vktrflo-env-switcher-progress {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(320%);
+  }
 }
 
 @media (max-width: 820px) {

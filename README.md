@@ -1,31 +1,52 @@
 # ComfyUI-VKTRFLO-EnvSwitcher
 
-ComfyUI custom node package that exposes VKTRFLO managed-runtime status and engine switching controls from inside the active ComfyUI session.
+ComfyUI custom node package that mounts a VKTRFLO runtime-control panel inside the active ComfyUI session.
 
-This is a UI-first control-plane extension:
+This package is intentionally thin:
 
-- it registers same-origin ComfyUI routes
-- it mounts a VKTRFLO panel inside the ComfyUI frontend
-- it talks to a running VKTRFLO host service
-- it does not register execution graph nodes
+- minimal Python registration so ComfyUI loads the extension
+- frontend HTML/CSS/JS panel inside ComfyUI
+- direct browser calls to the VKTRFLO host service on `38431`
+- optional `/system_stats` reads to verify what engine is actually live
+
+It does not register graph execution nodes, and it does not try to become a second runtime-control backend.
+
+## Current Architecture
+
+The VKTRFLO host service owns:
+
+- engine inventory
+- selected runtime metadata
+- start/stop/switch lifecycle
+- runtime error reporting
+
+This extension owns:
+
+- rendering a control panel inside ComfyUI
+- calling the host service directly
+- surviving refresh/reconnect during engine turnover
+
+That is the correct split.
 
 ## Current Status
 
 Implemented:
 
-- read VKTRFLO startup state from inside ComfyUI
-- read managed runtime inventory and active runtime facts
-- switch between installed managed runtimes
-- reconnect-aware polling after a switch request
-- same-origin proxy routes so the browser does not need to call the host service directly
+- panel mount inside ComfyUI
+- direct host reads for:
+  - `GET /api/v1/startup-state`
+  - `GET /api/v1/runtime/status`
+- direct host switch action for:
+  - `POST /api/v1/runtime/switch-and-start`
+- reconnect-aware polling with browser-local persisted switch state
+- optional live-engine verification through local `/system_stats`
 
 Not implemented yet:
 
-- standalone `start` action from the panel
-- standalone `stop` action from the panel
-- richer progress UX during reconnect
-- polished failure recovery UX
-- any graph execution nodes
+- standalone `start` action
+- standalone `stop` action
+- polished settings/override UX for host URL configuration
+- final production UX hardening
 
 ## Requirements
 
@@ -33,33 +54,32 @@ Not implemented yet:
 - a running VKTRFLO host service
 - at least one installed managed runtime in VKTRFLO
 
-If you want switching to be meaningful, you need at least two installed runtimes in VKTRFLO for the same profile.
+If you want switching to be meaningful, you need at least two installed runtimes for the same profile.
 
 ## Host Service Dependency
 
-By default the extension expects the VKTRFLO host service at:
+By default the panel resolves the host service from the current ComfyUI page hostname:
 
-- `http://127.0.0.1:38431`
+- `http://<current-hostname>:38431`
 
-Override that with:
+Examples:
 
-- `VKTRFLO_SERVICE_BASE_URL`
+- if ComfyUI is loaded from `http://127.0.0.1:8188`, host default is `http://127.0.0.1:38431`
+- if ComfyUI is loaded from `http://10.0.0.164:8188`, host default is `http://10.0.0.164:38431`
 
-Example:
+You can override that in the browser by setting:
 
-```powershell
-$env:VKTRFLO_SERVICE_BASE_URL = "http://10.0.0.164:38431"
-```
+- `window.VKTRFLO_SERVICE_BASE_URL`
 
-```bash
-export VKTRFLO_SERVICE_BASE_URL="http://10.0.0.164:38431"
-```
+or by populating local storage key:
 
-This extension is not a generic runtime manager for vanilla ComfyUI. It is a VKTRFLO control surface mounted inside ComfyUI.
+- `vktrflo.env-switcher.service-base-url`
+
+This package is not a generic runtime manager for vanilla ComfyUI. It is a VKTRFLO control surface mounted inside ComfyUI.
 
 ## Installation
 
-Place the repo in your ComfyUI `custom_nodes` directory:
+Place the repo in your ComfyUI `custom_nodes` directory.
 
 ### Windows
 
@@ -79,13 +99,6 @@ Then restart ComfyUI.
 
 ## What It Registers
 
-Backend:
-
-- `GET /vktrflo/env-switcher/config`
-- `GET /vktrflo/env-switcher/runtime/startup-state`
-- `GET /vktrflo/env-switcher/runtime/status`
-- `POST /vktrflo/env-switcher/runtime/switch-and-start`
-
 Frontend:
 
 - a VKTRFLO env-switcher panel mounted into the ComfyUI UI
@@ -95,20 +108,20 @@ Package integration shape:
 - `WEB_DIRECTORY = "./web"`
 - `NODE_CLASS_MAPPINGS = {}`
 
-This is intentional. The package is a frontend/control-plane extension, not a node pack.
+That is intentional. This is a frontend/control-plane extension, not a node pack.
 
 ## How Switching Works
 
-The switch button does not fake anything in the browser.
+The switch button is a thin host-service client.
 
-It sends a real request through the ComfyUI-local proxy to the VKTRFLO host service:
+Flow:
 
-- ComfyUI panel
-- `POST /vktrflo/env-switcher/runtime/switch-and-start`
-- VKTRFLO host `POST /api/v1/runtime/switch-and-start`
-- host changes active runtime
-- host starts the selected runtime
-- panel polls until the new runtime converges back to `ready`
+1. panel selects a target installed engine
+2. panel calls host `POST /api/v1/runtime/switch-and-start`
+3. host performs the real stop/select/start lifecycle
+4. panel persists in-flight switch state in browser storage
+5. panel polls host state until the replacement engine converges
+6. panel optionally checks `/system_stats` so it does not report fake success
 
 That means the extension is self-disruptive by design. It is issuing a control-plane command from inside the engine session that may tear down the current engine and bring it back as a different runtime.
 
@@ -123,9 +136,9 @@ VKTRFLO host development can bundle this extension automatically into managed ru
 ## Limitations
 
 - The panel depends on VKTRFLO host APIs and is not useful without them.
-- If the host service is down, the panel will surface proxy/fetch failures.
-- Engine switching is only as good as the installed runtime inventory and host lifecycle behavior.
-- The panel currently assumes a single VKTRFLO host target.
+- If the host service is down, the panel will surface direct fetch failures.
+- Engine switching is only as good as the host lifecycle behavior.
+- Browser caching can keep stale extension assets loaded until a hard refresh.
 
 ## Repository Scope
 

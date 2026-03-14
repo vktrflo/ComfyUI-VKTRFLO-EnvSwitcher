@@ -4,9 +4,3 @@ version = "0.1.0"
 description = "VKTRFLO managed-runtime panel for ComfyUI"
 requires-python = ">=3.10"
 dependencies = []
-
-[tool.setuptools]
-include-package-data = true
-
-[tool.setuptools.packages.find]
-include = ["vktrflo_env_switcher*"]

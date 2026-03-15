@@ -1,7 +1,7 @@
 .vktrflo-env-switcher {
   position: fixed;
   z-index: 95;
-  width: min(36rem, calc(100vw - 1.5rem));
+  width: min(48rem, calc(100vw - 1.5rem));
   max-height: min(42rem, calc(100vh - 2rem));
   display: grid;
   gap: 0.8rem;
@@ -387,7 +387,7 @@
 
 @media (max-width: 820px) {
   .vktrflo-env-switcher {
-    width: min(36rem, calc(100vw - 1rem));
+    width: min(48rem, calc(100vw - 1rem));
     max-height: calc(100vh - 1rem);
   }
 

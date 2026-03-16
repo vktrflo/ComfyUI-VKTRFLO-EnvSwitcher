@@ -456,6 +456,24 @@ function currentTorchVersion(runtime) {
   );
 }
 
+function currentSageAttentionVersion(runtime) {
+  return (
+    String(runtime?.sage_attention_version ?? "").trim()
+    || String(selectedProfileRuntimeDetail()?.sage_attention_version ?? "").trim()
+    || String(state.runtimeStatus?.base_domain_sage_attention_version ?? "").trim()
+    || "Not Installed"
+  );
+}
+
+function currentNunchakuVersion(runtime) {
+  return (
+    String(runtime?.nunchaku_version ?? "").trim()
+    || String(selectedProfileRuntimeDetail()?.nunchaku_version ?? "").trim()
+    || String(state.runtimeStatus?.base_domain_nunchaku_version ?? "").trim()
+    || "Not Installed"
+  );
+}
+
 function currentEngineHeadline() {
   return `ComfyUI: ${currentComfyUiVersion()} (${gpuShortLabel()})`;
 }
@@ -976,6 +994,8 @@ function renderExpandedBody(container, runtime) {
   renderFact(facts, "Current Engine", currentEngineHeadline());
   renderFact(facts, "Python", currentPythonVersion(runtime));
   renderFact(facts, "PyTorch", currentTorchVersion(runtime));
+  renderFact(facts, "Sage Attn", currentSageAttentionVersion(runtime));
+  renderFact(facts, "Nunchaku", currentNunchakuVersion(runtime));
   renderFact(facts, "Last Started", formatTimestamp(runtime?.last_launched_at));
   renderFactLink(facts, "Host UI", defaultHostUiUrl(), defaultHostUiUrl());
   renderInstallationPathActions(facts, runtime?.engine_dir ?? activeRuntimeDetail()?.engine_dir ?? "");

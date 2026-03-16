@@ -1,5 +1,8 @@
 # ComfyUI-VKTRFLO-EnvSwitcher
 
+> **VKTRFLO is not yet publicly available.**
+> Installing this custom node will have no effect until the VKTRFLO installer is publicly released. The host service this extension depends on ships with the VKTRFLO runtime — without it, the panel has nothing to talk to. Watch the main [VKTRFLO repository](https://github.com/vktrflo/vktrflo) for the public release.
+
 ComfyUI custom node package that mounts a VKTRFLO runtime-control panel inside the active ComfyUI session.
 
 This package is intentionally thin:

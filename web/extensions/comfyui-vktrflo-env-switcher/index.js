@@ -8,7 +8,6 @@ const RUNTIME_STATUS_PATH = "/api/v1/runtime/status";
 const SWITCH_AND_START_PATH = "/api/v1/runtime/switch-and-start";
 const RUNTIME_START_PATH = "/api/v1/runtime/start";
 const RUNTIME_STOP_PATH = "/api/v1/runtime/stop";
-const OPEN_ACTIVE_INSTALLATION_PATH = "/api/v1/files/open/active-comfyui-installation";
 const SYSTEM_STATS_URL = "/system_stats";
 const PANEL_ID = "vktrflo-env-switcher-panel";
 const LAUNCHER_ID = "vktrflo-env-switcher-launcher";
@@ -724,10 +723,18 @@ function createElement(tag, options = {}) {
 }
 
 async function copyToClipboard(value) {
-  if (typeof navigator === "undefined" || !navigator.clipboard || !value) {
-    return;
+  if (!value) return;
+  if (typeof navigator !== "undefined" && navigator.clipboard) {
+    await navigator.clipboard.writeText(value);
+  } else {
+    const el = document.createElement("textarea");
+    el.value = value;
+    el.style.cssText = "position:fixed;top:-9999px;left:-9999px;opacity:0";
+    document.body.appendChild(el);
+    el.select();
+    document.execCommand("copy");
+    document.body.removeChild(el);
   }
-  await navigator.clipboard.writeText(value);
   showToast("Copied ComfyUI installation path.", "success");
 }
 
@@ -894,25 +901,11 @@ function renderInstallationPathActions(container, installationPath) {
   }));
 
   const actions = createElement("div", { className: "vktrflo-env-switcher__fact-actions" });
-  const openButton = createElement("button", {
-    className: "vktrflo-env-switcher__fact-link-button",
+  actions.appendChild(createElement("span", {
+    className: "vktrflo-env-switcher__fact-path-text",
     text: truncateInstallPath(installationPath),
-    attrs: {
-      type: "button",
-      title: installationPath || "ComfyUI installation path unavailable",
-    },
-  });
-  openButton.disabled = !installationPath;
-  openButton.onclick = () => {
-    void postNoContent(serviceUrl(OPEN_ACTIVE_INSTALLATION_PATH))
-      .then(() => {
-        showToast("Explorer will open behind the browser.", "info", 3600);
-      })
-      .catch((error) => {
-        state.error = error instanceof Error ? error.message : String(error);
-        setMode("error");
-      });
-  };
+    attrs: { title: installationPath || "ComfyUI installation path unavailable" },
+  }));
 
   const copyButton = createElement("button", {
     className: "vktrflo-env-switcher__copy-button",
@@ -933,7 +926,6 @@ function renderInstallationPathActions(container, installationPath) {
     void copyToClipboard(installationPath);
   };
 
-  actions.appendChild(openButton);
   actions.appendChild(copyButton);
   row.appendChild(actions);
   container.appendChild(row);
